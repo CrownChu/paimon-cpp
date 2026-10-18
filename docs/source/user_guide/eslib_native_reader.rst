@@ -51,7 +51,8 @@ Runtime options
 ---------------
 
 Pass these options to ``GlobalIndexScan::Create`` or
-``GlobalIndexerFactory::Get("es-index", options)``:
+``GlobalIndexerFactory::Get("es-index", options)``. For automatic scalar pruning,
+pass the same options to the table scan and read context builders:
 
 .. list-table::
    :header-rows: 1
@@ -123,6 +124,23 @@ pre-filters and full-text include-row IDs into the local domain. Scored results
 are ordered by row ID with corresponding scores, as the SDK requires. As with
 other SDK index backends, the caller merges and ranks candidates across shards.
 
+To read complete Paimon rows, pass the global index result to
+``ScanContextBuilder::SetGlobalIndexResult``, create the table scan plan, and read
+its splits with ``TableRead``. Request ``_ROW_ID`` and ``_INDEX_SCORE`` when row
+identity and scores are needed. Pin both the index scan and data scan to the same
+snapshot. Explicit vector and full-text readers search the rows covered by that
+snapshot's index archives; they do not search data appended after index creation.
+
+Automatic scalar pruning checks the participating index ranges whenever an
+``es-index`` is involved. If the ranges do not prove complete coverage of
+``[0, snapshot.nextRowId)``, the table scan falls back to data scanning so appended
+or otherwise uncovered rows are retained. This conservative check can also fall
+back for partition-filtered scans or snapshots with deleted row-ID ranges. It
+preserves the existing behavior of scans using other index backends alone.
+For exact predicate results, call ``ReadContextBuilder::EnablePredicateFilter(true)``
+as well as ``SetPredicate``; precise row filtering is disabled by default in the
+SDK. The fallback does not construct a bitmap containing every uncovered row ID.
+
 The current native v1 ABI supports at most one million returned rows per scalar
 or full-text request and 10,000 vector neighbors. An incomplete scalar result is
 rejected. Callback vector pre-filter enumeration is limited to one million shard
@@ -167,3 +185,32 @@ variables are absent; a complete interoperability run must report zero skipped
 tests. Tests include sparse vectors, nulls, long values above 2^53, metric scores,
 pre-filters, global offsets, multi-field discovery through a snapshot/index
 manifest, corrupted sealed bytes, metadata/runtime mismatches and cleanup.
+
+``test/inte/eslib/GenerateESLibTable.java`` additionally creates six real tables
+through Java catalog/write/commit APIs: Parquet and ORC crossed with HNSW,
+INT8 HNSW and DiskBBQ. It commits 128 rows in two partitions, builds and commits
+four native index shards, then appends eight unindexed rows in a third partition.
+Java reads both snapshots back from their data files and writes independent
+``oracle.json`` files. Parquet uses ``VECTOR<FLOAT, 33>``; the selected Java ORC
+writer does not support that type, so ORC uses ``ARRAY<FLOAT>`` with an explicit
+index dimension of 33.
+
+Compile this generator with Java 11 against the matching Paimon core, packaged
+format and native-enabled ``paimon-eslib`` dependencies. Run it with a new output
+directory (the generator refuses to overwrite an existing one):
+
+.. code-block:: bash
+
+   java -cp "${TABLE_FIXTURE_CLASSES}:${PAIMON_NATIVE_CLASSPATH}" \
+     org.apache.paimon.eslib.index.GenerateESLibTable /path/to/new-table-fixtures
+   export PAIMON_ESLIB_TABLE_FIXTURE_DIR=/path/to/new-table-fixtures
+   ./build/debug/paimon-eslib-index-test
+   ./build/debug/paimon-eslib-shared-index-test
+
+Together with the archive fixtures above, each executable runs 43 tests. The 30
+committed-table tests compare complete rows against Java's full scans, including
+large integers, nulls, vectors, dates, timestamps and partitions. They also verify
+native scalar activation on the fully indexed snapshot, safe fallback after the
+append, vector candidate ranking and scores, cross-shard pre-filters, full-text
+include IDs and result-driven row fetches. Both runtime and fixture environment
+variables must be supplied to run all 43 tests without skips.

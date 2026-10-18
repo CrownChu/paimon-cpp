@@ -19,6 +19,7 @@
 #include "paimon/core/global_index/global_index_scan_impl.h"
 
 #include <algorithm>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -33,6 +34,7 @@
 #include "paimon/global_index/bitmap_global_index_result.h"
 #include "paimon/global_index/global_indexer.h"
 #include "paimon/global_index/global_indexer_factory.h"
+#include "paimon/predicate/predicate_utils.h"
 
 namespace paimon {
 GlobalIndexScanImpl::GlobalIndexScanImpl(const std::shared_ptr<TableSchema>& table_schema,
@@ -40,13 +42,15 @@ GlobalIndexScanImpl::GlobalIndexScanImpl(const std::shared_ptr<TableSchema>& tab
                                          const std::shared_ptr<IndexPathFactory>& path_factory,
                                          IndexMetaMap&& index_metas,
                                          const std::shared_ptr<Executor>& executor,
-                                         const std::shared_ptr<MemoryPool>& pool)
+                                         const std::shared_ptr<MemoryPool>& pool,
+                                         const std::optional<int64_t>& next_row_id)
     : pool_(pool),
       table_schema_(table_schema),
       options_(options),
       index_file_manager_(std::make_shared<GlobalIndexFileManager>(
           options.GetFileSystem(), path_factory, /*checkpoint_path_factory=*/nullptr)),
       index_metas_(std::move(index_metas)),
+      next_row_id_(next_row_id),
       executor_(executor) {}
 
 Result<std::unique_ptr<GlobalIndexScanImpl>> GlobalIndexScanImpl::Create(
@@ -133,8 +137,9 @@ Result<std::unique_ptr<GlobalIndexScanImpl>> GlobalIndexScanImpl::Create(
             }
         }
     }
-    return std::unique_ptr<GlobalIndexScanImpl>(new GlobalIndexScanImpl(
-        table_schema, options, path_factory, std::move(index_metas), final_executor, pool));
+    return std::unique_ptr<GlobalIndexScanImpl>(
+        new GlobalIndexScanImpl(table_schema, options, path_factory, std::move(index_metas),
+                                final_executor, pool, snapshot.NextRowId()));
 }
 
 Result<std::shared_ptr<GlobalIndexEvaluator>> GlobalIndexScanImpl::GetOrCreateIndexEvaluator() {
@@ -245,6 +250,48 @@ GlobalIndexIOMeta GlobalIndexScanImpl::ToGlobalIndexIOMeta(
 
 Result<std::shared_ptr<GlobalIndexResult>> GlobalIndexScanImpl::Scan(
     const std::shared_ptr<Predicate>& predicate) {
+    // Native es-index archives can lag the selected snapshot after an append. Do
+    // not use their hits to prune rows unless all participating indexes cover the
+    // snapshot. Keep the existing indexed-domain behavior for other backends and
+    // for explicit vector/full-text CreateReader calls.
+    if (predicate) {
+        std::set<std::string> fields;
+        PAIMON_RETURN_NOT_OK(PredicateUtils::GetAllNames(predicate, &fields));
+        bool uses_es_index = false;
+        for (const auto& name : fields) {
+            PAIMON_ASSIGN_OR_RAISE(DataField field, table_schema_->GetField(name));
+            auto found = index_metas_.find(field.Id());
+            if (found != index_metas_.end() && found->second.count("es-index") != 0) {
+                uses_es_index = true;
+                break;
+            }
+        }
+        if (uses_es_index) {
+            if (!next_row_id_ || *next_row_id_ <= 0) {
+                return std::shared_ptr<GlobalIndexResult>();
+            }
+            const Range required(0, *next_row_id_ - 1);
+            for (const auto& name : fields) {
+                PAIMON_ASSIGN_OR_RAISE(DataField field, table_schema_->GetField(name));
+                auto found = index_metas_.find(field.Id());
+                if (found == index_metas_.end()) {
+                    continue;
+                }
+                for (const auto& [index_type, range_to_metas] : found->second) {
+                    std::vector<Range> coverage;
+                    for (const auto& [range, metas] : range_to_metas) {
+                        if (auto clipped = Range::Intersection(required, range)) {
+                            coverage.push_back(*clipped);
+                        }
+                    }
+                    coverage = Range::SortAndMergeOverlap(coverage, /*adjacent=*/true);
+                    if (coverage.size() != 1 || !(coverage.front() == required)) {
+                        return std::shared_ptr<GlobalIndexResult>();
+                    }
+                }
+            }
+        }
+    }
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<GlobalIndexEvaluator> evaluator,
                            GetOrCreateIndexEvaluator());
     return evaluator->Evaluate(predicate);

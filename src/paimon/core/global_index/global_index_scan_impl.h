@@ -68,7 +68,8 @@ class GlobalIndexScanImpl : public GlobalIndexScan {
                         const CoreOptions& options,
                         const std::shared_ptr<IndexPathFactory>& path_factory,
                         IndexMetaMap&& index_metas, const std::shared_ptr<Executor>& executor,
-                        const std::shared_ptr<MemoryPool>& pool);
+                        const std::shared_ptr<MemoryPool>& pool,
+                        const std::optional<int64_t>& next_row_id);
 
     Result<std::shared_ptr<GlobalIndexEvaluator>> GetOrCreateIndexEvaluator();
 
@@ -88,6 +89,7 @@ class GlobalIndexScanImpl : public GlobalIndexScan {
     CoreOptions options_;
     std::shared_ptr<GlobalIndexFileManager> index_file_manager_;
     IndexMetaMap index_metas_;
+    std::optional<int64_t> next_row_id_;
     std::shared_ptr<Executor> executor_;
     std::shared_ptr<GlobalIndexEvaluator> evaluator_;
 };

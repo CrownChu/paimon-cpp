@@ -47,6 +47,7 @@ if(PAIMON_BUILD_TESTS)
     add_paimon_test(eslib_index_test
                     SOURCES
                     eslib_global_index_test.cpp
+                    eslib_table_interop_test.cpp
                     STATIC_LINK_LIBS
                     paimon_shared
                     test_utils_static
@@ -54,6 +55,7 @@ if(PAIMON_BUILD_TESTS)
                     ${PAIMON_LOCAL_FILE_SYSTEM_STATIC_LINK_LIBS}
                     ${PAIMON_PARQUET_FILE_FORMAT_STATIC_LINK_LIBS}
                     ${PAIMON_AVRO_FILE_FORMAT_STATIC_LINK_LIBS}
+                    ${PAIMON_ORC_FILE_FORMAT_STATIC_LINK_LIBS}
                     parquet
                     OpenSSL::Crypto
                     ${CMAKE_DL_LIBS}
@@ -64,6 +66,7 @@ if(PAIMON_BUILD_TESTS)
         add_paimon_test(eslib_shared_index_test
                         SOURCES
                         eslib_global_index_test.cpp
+                        eslib_table_interop_test.cpp
                         STATIC_LINK_LIBS
                         paimon_shared
                         test_utils_static
@@ -71,6 +74,7 @@ if(PAIMON_BUILD_TESTS)
                         ${PAIMON_LOCAL_FILE_SYSTEM_STATIC_LINK_LIBS}
                         ${PAIMON_PARQUET_FILE_FORMAT_STATIC_LINK_LIBS}
                         ${PAIMON_AVRO_FILE_FORMAT_STATIC_LINK_LIBS}
+                        ${PAIMON_ORC_FILE_FORMAT_STATIC_LINK_LIBS}
                         parquet
                         ${GTEST_LINK_TOOLCHAIN})
     endif()
