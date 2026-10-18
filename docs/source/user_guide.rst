@@ -44,4 +44,5 @@ User Guide
    user_guide/prefetch
    user_guide/arrow
    user_guide/global_index
+   user_guide/eslib_native_reader
    user_guide/primary_key_global_index

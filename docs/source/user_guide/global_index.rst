@@ -30,6 +30,8 @@ Paimon C++ supports the following global index types:
 - **Full-Text Index (experimental)**: A full-text search index powered by the native
   ``paimon-full-text-index`` engine. It uses the same index file format as Java Paimon's
   ``full-text`` index.
+- **ESLib Native Index**: An optional reader for Java-produced native ``es-index`` archives,
+  supporting vector, text and scalar queries through elasticpp. See :doc:`eslib_native_reader`.
 - **Vector Index (Lumina)**: An approximate nearest neighbor (ANN) index powered by Lumina for vector similarity search with configurable distance metrics.
 
 Global indexes work on top of Data Evolution tables. To use global indexes, your table must have:

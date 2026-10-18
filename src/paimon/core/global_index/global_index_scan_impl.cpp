@@ -18,6 +18,7 @@
  */
 #include "paimon/core/global_index/global_index_scan_impl.h"
 
+#include <algorithm>
 #include <string>
 #include <thread>
 #include <utility>
@@ -118,6 +119,19 @@ Result<std::unique_ptr<GlobalIndexScanImpl>> GlobalIndexScanImpl::Create(
         Range range(index_meta->row_range_start, index_meta->row_range_end);
         index_metas[index_meta->index_field_id][index_file_meta->IndexType()][range].push_back(
             index_file_meta);
+        // Java's es-index archive indexes each extra column independently. Expose the
+        // same archive under those columns so SDK readers bind scalar/text predicates to
+        // the requested field. Other index backends can use extras as attributes only.
+        if (index_file_meta->IndexType() == "es-index" && index_meta->extra_field_ids) {
+            for (int32_t extra_field_id : *index_meta->extra_field_ids) {
+                if (extra_field_id != index_meta->index_field_id) {
+                    auto& files = index_metas[extra_field_id]["es-index"][range];
+                    if (std::find(files.begin(), files.end(), index_file_meta) == files.end()) {
+                        files.push_back(index_file_meta);
+                    }
+                }
+            }
+        }
     }
     return std::unique_ptr<GlobalIndexScanImpl>(new GlobalIndexScanImpl(
         table_schema, options, path_factory, std::move(index_metas), final_executor, pool));
