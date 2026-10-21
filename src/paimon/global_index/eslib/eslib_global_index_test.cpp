@@ -158,10 +158,13 @@ TEST(PES1FactoryTest, RegistersAlongsideLegacyEsmEntry) {
 }
 TEST_F(PES1IndexTest, PreservesNonzeroSealOriginAndPrefilterLocalRows) {
     const char* algorithms = std::getenv("PAIMON_PES1_ALL_ALGORITHMS");
-    std::vector<std::string> scenarios = {"hnsw-l2_norm", "hnswq-l2_norm"};
+    std::vector<std::string> scenarios = {"hnsw-l2_norm", "hnswq-l2_norm", "hnsw-cosine",
+                                          "hnswq-cosine"};
     if (algorithms) {
         scenarios.push_back("int8_hnsw-l2_norm");
         scenarios.push_back("bbq_disk-l2_norm");
+        scenarios.push_back("int8_hnsw-cosine");
+        scenarios.push_back("bbq_disk-cosine");
     }
     for (const auto& scenario : scenarios) {
         SCOPED_TRACE(scenario);
@@ -188,6 +191,28 @@ TEST_F(PES1IndexTest, PreservesNonzeroSealOriginAndPrefilterLocalRows) {
         ASSERT_EQ(rows.count(101), 0u);
     }
 }
+TEST_F(PES1IndexTest, TextAndKeywordCompanionUseOriginalSealOrigin) {
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> reader,
+                         Open("hnsw-l2_norm", "title", arrow::utf8()));
+    auto query =
+        std::make_shared<FullTextSearch>("title", "{\"match\":{\"query\":\"alpha\"}}", 512);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ScoredGlobalIndexResult> result,
+                         reader->VisitFullTextSearch(query));
+    ASSERT_OK_AND_ASSIGN(std::set<int64_t> rows, Rows(result));
+    ASSERT_EQ(rows.size(), 171u);
+    for (auto row : rows) {
+        ASSERT_EQ(row % 3, 0);
+    }
+    query->pre_filter = [](int64_t row) { return row == 507; };
+    ASSERT_OK_AND_ASSIGN(result, reader->VisitFullTextSearch(query));
+    ASSERT_OK_AND_ASSIGN(rows, Rows(result));
+    ASSERT_EQ(rows, std::set<int64_t>({507}));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexResult> exact,
+                         reader->VisitEqual(Literal(FieldType::STRING, "alpha native search", 19)));
+    ASSERT_OK_AND_ASSIGN(rows, Rows(exact));
+    ASSERT_EQ(rows.size(), 171u);
+}
+
 TEST_F(PES1IndexTest, RejectsCorruptionAndWrongFactoryBeforeOpeningNative) {
     const std::string scenario = "hnsw-l2_norm";
     std::string bytes = Load(root_ + "/" + scenario + "/metadata.pes1");
