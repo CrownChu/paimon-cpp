@@ -203,7 +203,9 @@ TEST_F(PES1IndexTest, TextAndKeywordCompanionUseOriginalSealOrigin) {
     for (auto row : rows) {
         ASSERT_EQ(row % 3, 0);
     }
-    query->pre_filter = [](int64_t row) { return row == 507; };
+    RoaringBitmap64 include;
+    include.Add(507);
+    query->include_row_ids = include;
     ASSERT_OK_AND_ASSIGN(result, reader->VisitFullTextSearch(query));
     ASSERT_OK_AND_ASSIGN(rows, Rows(result));
     ASSERT_EQ(rows, std::set<int64_t>({507}));
