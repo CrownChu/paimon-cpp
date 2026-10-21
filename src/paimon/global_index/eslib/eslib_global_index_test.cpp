@@ -215,6 +215,32 @@ TEST_F(PES1IndexTest, TextAndKeywordCompanionUseOriginalSealOrigin) {
     ASSERT_EQ(rows.size(), 255u);
 }
 
+TEST_F(PES1IndexTest, IkModesUseTheSamePinnedNativeDictionary) {
+    if (!std::filesystem::exists(root_ + "/ik_smart/metadata.pes1"))
+        GTEST_SKIP() << "Set actual PES1 IK fixtures and their ES_PATH_CONF dictionaries";
+    for (const std::string mode : {"ik_smart", "ik_max_word"}) {
+        SCOPED_TRACE(mode);
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> reader,
+                             Open(mode, "title", arrow::utf8()));
+        auto short_word =
+            std::make_shared<FullTextSearch>("title", "{\"match\":{\"query\":\"中华\"}}", 10);
+        ASSERT_OK_AND_ASSIGN(auto result, reader->VisitFullTextSearch(short_word));
+        ASSERT_OK_AND_ASSIGN(auto rows, Rows(result));
+        ASSERT_EQ(rows, mode == "ik_smart" ? std::set<int64_t>() : std::set<int64_t>({1}));
+        auto people =
+            std::make_shared<FullTextSearch>("title", "{\"match\":{\"query\":\"人民\"}}", 10);
+        ASSERT_OK_AND_ASSIGN(result, reader->VisitFullTextSearch(people));
+        ASSERT_OK_AND_ASSIGN(rows, Rows(result));
+        ASSERT_EQ(rows, mode == "ik_smart" ? std::set<int64_t>({2}) : std::set<int64_t>({1, 2}));
+        RoaringBitmap64 include;
+        include.Add(2);
+        people->include_row_ids = include;
+        ASSERT_OK_AND_ASSIGN(result, reader->VisitFullTextSearch(people));
+        ASSERT_OK_AND_ASSIGN(rows, Rows(result));
+        ASSERT_EQ(rows, std::set<int64_t>({2}));
+    }
+}
+
 TEST_F(PES1IndexTest, ReadsHistoricalPeqEnvelopeWithFullArchiveVerification) {
     std::string pes = Load(root_ + "/hnsw-l2_norm/metadata.pes1");
     std::string path = root_ + "/hnsw-l2_norm/archive.bin";
