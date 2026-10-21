@@ -535,7 +535,8 @@ Result<std::shared_ptr<ScoredGlobalIndexResult>> ESLibGlobalIndexReader::VisitFu
         std::vector<std::string> ids;
         for (auto it = search->include_row_ids->Begin(); it != search->include_row_ids->End();
              ++it) {
-            if (*it >= 0 && *it < archive_->Rows()) ids.push_back(Quote(std::to_string(*it)));
+            if (*it >= 0 && *it < archive_->Rows())
+                ids.push_back(Quote(std::to_string(archive_->RowStart() + *it)));
             if (ids.size() > 1000000)
                 return Status::Invalid("ESLib full-text include-row-id limit exceeded");
         }
