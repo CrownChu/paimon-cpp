@@ -68,8 +68,27 @@ class ESLibGlobalIndexFactory final : public GlobalIndexerFactory {
     }
     Result<std::unique_ptr<GlobalIndexer>> Create(
         const std::map<std::string, std::string>& options) const override {
-        return std::unique_ptr<GlobalIndexer>(std::make_unique<ESLibGlobalIndex>(options));
+        auto selected = options;
+        selected["native.expected-index-type"] = "es-index";
+        return std::unique_ptr<GlobalIndexer>(
+            std::make_unique<ESLibGlobalIndex>(std::move(selected)));
     }
 };
 REGISTER_PAIMON_FACTORY(ESLibGlobalIndexFactory);
+
+class PaimonElasticsearchGlobalIndexFactory final : public GlobalIndexerFactory {
+ public:
+    static constexpr const char* IDENTIFIER = "paimon-elasticsearch-global";
+    const char* Identifier() const override {
+        return IDENTIFIER;
+    }
+    Result<std::unique_ptr<GlobalIndexer>> Create(
+        const std::map<std::string, std::string>& options) const override {
+        auto selected = options;
+        selected["native.expected-index-type"] = "paimon-elasticsearch";
+        return std::unique_ptr<GlobalIndexer>(
+            std::make_unique<ESLibGlobalIndex>(std::move(selected)));
+    }
+};
+REGISTER_PAIMON_FACTORY(PaimonElasticsearchGlobalIndexFactory);
 }  // namespace paimon::eslib

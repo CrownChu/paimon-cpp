@@ -48,6 +48,12 @@ class Archive {
     const std::map<std::string, std::string>& PrimaryTypes() const {
         return primary_types_;
     }
+    const std::string& IndexType() const {
+        return index_type_;
+    }
+    int64_t RowStart() const {
+        return row_start_;
+    }
     int64_t Rows() const {
         return rows_;
     }
@@ -60,7 +66,8 @@ class Archive {
     std::map<std::string, Field> fields_;
     std::map<std::string, std::string> primary_types_;
     std::string directory_;
-    int64_t rows_ = 0;
+    int64_t rows_ = 0, row_start_ = 0;
+    std::string index_type_ = "es-index";
     uint64_t handle_ = 0;
     void* library_ = nullptr;
     abi::QueryResult* (*query_)(uint64_t, const abi::Query*) = nullptr;

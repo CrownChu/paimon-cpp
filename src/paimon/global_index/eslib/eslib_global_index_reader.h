@@ -39,7 +39,7 @@ class ESLibGlobalIndexReader final : public GlobalIndexReader {
         return true;
     }
     std::string GetIndexType() const override {
-        return "es-index";
+        return archive_->IndexType();
     }
     Result<std::shared_ptr<GlobalIndexResult>> VisitIsNull() override;
     Result<std::shared_ptr<GlobalIndexResult>> VisitIsNotNull() override;

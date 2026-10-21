@@ -102,14 +102,14 @@ class ESLibIndexTest : public ::testing::Test {
         const GlobalIndexIOMeta* supplied = nullptr) {
         PAIMON_ASSIGN_OR_RAISE(
             std::unique_ptr<GlobalIndexer> indexer,
-            GlobalIndexerFactory::Get("es-index", options ? *options : options_));
+            GlobalIndexerFactory::Get(index_type_, options ? *options : options_));
         if (!indexer) return Status::Invalid("ESLib factory not linked");
         std::string path = root_ + "/" + fixture + "/archive.bin";
         std::error_code error;
         auto size = std::filesystem::file_size(path, error);
         if (error) return Status::IOError("Missing Java fixture: ", path);
-        auto metadata =
-            std::make_shared<Bytes>(Load(root_ + "/" + fixture + "/metadata.bin"), pool_.get());
+        auto metadata = std::make_shared<Bytes>(Load(root_ + "/" + fixture + "/" + metadata_name_),
+                                                pool_.get());
         GlobalIndexIOMeta meta(path, size, metadata);
         ArrowSchema c_schema;
         auto exported = arrow::ExportSchema(*arrow::schema({arrow::field(field, type)}), &c_schema);
@@ -120,9 +120,88 @@ class ESLibIndexTest : public ::testing::Test {
         return result;
     }
     std::string root_;
+    std::string index_type_ = "es-index", metadata_name_ = "metadata.bin";
     std::map<std::string, std::string> options_;
     std::shared_ptr<MemoryPool> pool_;
 };
+class PES1IndexTest : public ESLibIndexTest {
+ protected:
+    void SetUp() override {
+        const char* root = std::getenv("PAIMON_PES1_FIXTURE_DIR");
+        const char* library = std::getenv("PAIMON_ESLIB_NATIVE_LIBRARY");
+        const char* commit = std::getenv("PAIMON_ESLIB_NATIVE_COMMIT");
+        const char* sha = std::getenv("PAIMON_ESLIB_NATIVE_SHA256");
+        if (!root || !library || !commit || !sha)
+            GTEST_SKIP() << "Set actual PES1/native runtime fixtures";
+        root_ = root;
+        index_type_ = "paimon-elasticsearch";
+        metadata_name_ = "metadata.pes1";
+        pool_ = GetDefaultPool();
+        options_ = {{"global-index.paimon-elasticsearch.native.library-path", library},
+                    {"global-index.paimon-elasticsearch.native.commit", commit},
+                    {"global-index.paimon-elasticsearch.native.sha256", sha}};
+    }
+    std::vector<float> QueryVector(int32_t row) {
+        std::vector<float> value(33);
+        for (int32_t dim = 0; dim < 33; ++dim)
+            value[dim] = static_cast<float>(std::sin((row + 1) * (dim + 3) * 0.17) +
+                                            0.3 * std::cos((row + dim) * 0.13));
+        return value;
+    }
+};
+TEST(PES1FactoryTest, RegistersAlongsideLegacyEsmEntry) {
+    for (const char* type : {"es-index", "paimon-elasticsearch"}) {
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalIndexer> indexer,
+                             GlobalIndexerFactory::Get(type, {}));
+        ASSERT_TRUE(indexer);
+    }
+}
+TEST_F(PES1IndexTest, PreservesNonzeroSealOriginAndPrefilterLocalRows) {
+    const char* algorithms = std::getenv("PAIMON_PES1_ALL_ALGORITHMS");
+    std::vector<std::string> scenarios = {"hnsw-l2_norm", "hnswq-l2_norm"};
+    if (algorithms) {
+        scenarios.push_back("int8_hnsw-l2_norm");
+        scenarios.push_back("bbq_disk-l2_norm");
+    }
+    for (const auto& scenario : scenarios) {
+        SCOPED_TRACE(scenario);
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> reader, Open(scenario));
+        ASSERT_EQ(reader->GetIndexType(), "paimon-elasticsearch");
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<ScoredGlobalIndexResult> nearest,
+                             reader->VisitVectorSearch(Search(QueryVector(101))));
+        ASSERT_OK_AND_ASSIGN(std::set<int64_t> rows, Rows(nearest));
+        ASSERT_EQ(rows, std::set<int64_t>({101}));
+        auto single = Search(QueryVector(101), 10);
+        single->pre_filter = [](int64_t row) { return row == 507; };
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<ScoredGlobalIndexResult> selected,
+                             reader->VisitVectorSearch(single));
+        ASSERT_OK_AND_ASSIGN(rows, Rows(selected));
+        ASSERT_EQ(rows, std::set<int64_t>({507}));
+        single->pre_filter = [](int64_t) { return false; };
+        ASSERT_OK_AND_ASSIGN(selected, reader->VisitVectorSearch(single));
+        ASSERT_OK_AND_ASSIGN(rows, Rows(selected));
+        ASSERT_TRUE(rows.empty());
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexResult> nulls, reader->VisitIsNull());
+        ASSERT_OK_AND_ASSIGN(rows, Rows(nulls));
+        ASSERT_EQ(rows.count(17), 1u);
+        ASSERT_EQ(rows.count(14), 1u);
+        ASSERT_EQ(rows.count(101), 0u);
+    }
+}
+TEST_F(PES1IndexTest, RejectsCorruptionAndWrongFactoryBeforeOpeningNative) {
+    const std::string scenario = "hnsw-l2_norm";
+    std::string bytes = Load(root_ + "/" + scenario + "/metadata.pes1");
+    ASSERT_GT(bytes.size(), 40u);
+    bytes[35] ^= 1;
+    const std::string path = root_ + "/" + scenario + "/archive.bin";
+    GlobalIndexIOMeta meta(path, std::filesystem::file_size(path),
+                           std::make_shared<Bytes>(bytes, pool_.get()));
+    ASSERT_NOK_WITH_MSG(
+        Open(scenario, "embedding", arrow::fixed_size_list(arrow::float32(), 33), nullptr, &meta),
+        "CRC32C");
+    index_type_ = "es-index";
+    ASSERT_NOK_WITH_MSG(Open(scenario), "registered index type");
+}
 TEST(ESLibFactoryTest, RegisteredAndWriteUnsupported) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalIndexer> indexer,
                          GlobalIndexerFactory::Get("es-index", {}));

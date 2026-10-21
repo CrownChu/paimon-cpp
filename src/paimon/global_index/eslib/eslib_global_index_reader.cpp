@@ -70,6 +70,8 @@ Result<std::string> ScalarValue(const Literal& value, const Field& field) {
         return Quote(value.ToString());
     if (field.type != "SCALAR")
         return Status::NotImplemented("Unsupported ESLib scalar field type");
+    if (value.GetType() == FieldType::BOOLEAN && field.scalar_type == "BOOLEAN")
+        return value.GetValue<bool>() ? std::string("true") : std::string("false");
     switch (value.GetType()) {
         case FieldType::TINYINT:
             if (field.scalar_type == "INT" || field.scalar_type == "LONG")
@@ -366,9 +368,10 @@ Result<std::shared_ptr<GlobalIndexReader>> ESLibGlobalIndexReader::Create(
                      : field.scalar_type == "INT"
                          ? type->id() == arrow::Type::INT32 || type->id() == arrow::Type::INT16 ||
                                type->id() == arrow::Type::INT8
-                     : field.scalar_type == "FLOAT"  ? type->id() == arrow::Type::FLOAT
-                     : field.scalar_type == "DOUBLE" ? type->id() == arrow::Type::DOUBLE
-                                                     : false;
+                     : field.scalar_type == "FLOAT"   ? type->id() == arrow::Type::FLOAT
+                     : field.scalar_type == "DOUBLE"  ? type->id() == arrow::Type::DOUBLE
+                     : field.scalar_type == "BOOLEAN" ? type->id() == arrow::Type::BOOL
+                                                      : false;
     }
     if (!compatible) return Status::Invalid("SDK schema differs from persisted ESLib field type");
     return std::shared_ptr<GlobalIndexReader>(
@@ -496,7 +499,8 @@ Result<std::shared_ptr<ScoredGlobalIndexResult>> ESLibGlobalIndexReader::VisitVe
                 "Native V1 prefilter enumeration exceeds one million rows");
         std::vector<std::string> ids;
         for (int64_t row = 0; row < archive_->Rows(); ++row)
-            if (search->pre_filter(row)) ids.push_back(Quote(std::to_string(row)));
+            if (search->pre_filter(row))
+                ids.push_back(Quote(std::to_string(archive_->RowStart() + row)));
         if (ids.empty()) return ToResult({});
         filters.push_back(FilterIds(ids));
     }

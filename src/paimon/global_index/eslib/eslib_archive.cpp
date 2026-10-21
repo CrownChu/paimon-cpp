@@ -120,9 +120,15 @@ class Cursor {
         }
         return static_cast<int32_t>(value);
     }
-    Result<std::string> String() {
+    Result<std::string> Bytes(size_t size) {
+        if (size > data_.size() - offset_) return Status::Invalid("Truncated native metadata");
+        std::string value = data_.substr(offset_, size);
+        offset_ += size;
+        return value;
+    }
+    Result<std::string> String(size_t limit = 1024 * 1024) {
         PAIMON_ASSIGN_OR_RAISE(uint64_t size, Number(4));
-        if (size > 1024 * 1024 || size > data_.size() - offset_) {
+        if (size > limit || size > data_.size() - offset_) {
             return Status::Invalid("Invalid ESM1 string length");
         }
         std::string value = data_.substr(offset_, size);
@@ -205,6 +211,15 @@ std::string JsonString(const std::string& text) {
     writer.String(text.data(), text.size());
     return {buffer.GetString(), buffer.GetSize()};
 }
+Status PinDictionary(const std::string& selected) {
+    static std::mutex mutex;
+    static std::string pinned;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!pinned.empty() && pinned != selected)
+        return Status::Invalid("IK dictionaries changed; use a fresh process");
+    pinned = selected;
+    return Status::OK();
+}
 Result<std::string> ConfigDigest(const std::map<std::string, Field>& fields,
                                  std::string* selected_dictionary) {
     std::map<std::string, std::string> configs;
@@ -226,6 +241,7 @@ Result<std::string> ConfigDigest(const std::map<std::string, Field>& fields,
         if (!config_path || !*config_path)
             return Status::Invalid("IK requires ES_PATH_CONF/analysis-ik dictionaries");
         std::string dictionary = "{";
+        std::string dictionary_identity;
         for (const char* name : {"main.dic", "quantifier.dic", "stopword.dic"}) {
             std::filesystem::path path = std::filesystem::path(config_path) / "analysis-ik" / name;
             std::error_code error;
@@ -237,11 +253,12 @@ Result<std::string> ConfigDigest(const std::map<std::string, Field>& fields,
             if (!input.read(bytes.data(), size))
                 return Status::IOError("Cannot read IK dictionary");
             PAIMON_ASSIGN_OR_RAISE(std::string sha, Sha(bytes));
+            dictionary_identity += sha;
             if (dictionary.size() > 1) dictionary += ',';
             dictionary += JsonString(name) + ':' + JsonString(sha);
         }
         dictionary += '}';
-        *selected_dictionary = dictionary;
+        *selected_dictionary = dictionary_identity;
         configs["__native_ik_dictionary"] = dictionary;
     }
     std::string json = "{";
@@ -254,6 +271,281 @@ Result<std::string> ConfigDigest(const std::map<std::string, Field>& fields,
 struct Offset {
     int64_t offset, length;
 };
+// PES1 is the existing Java wire format. Normalize its descriptor in memory;
+// the original seal identity and archive bytes are never rewritten.
+struct PesMetadata {
+    abi::Identity identity;
+    std::string table, manifest, archive_sha;
+    std::map<std::string, Offset> offsets;
+    std::map<std::string, Field> fields;
+    std::map<std::string, std::string> primary_types;
+};
+uint32_t Castagnoli(const char* bytes, size_t length) {
+    // Paimon's historical CRC32C helper uses the IEEE polynomial. PES1 uses Castagnoli.
+    uint32_t crc = ~uint32_t{0};
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= static_cast<uint8_t>(bytes[i]);
+        for (int32_t bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0x82f63b78U & (0U - (crc & 1U)));
+    }
+    return ~crc;
+}
+std::string Hex(const std::string& value) {
+    std::string hex;
+    for (uint8_t c : value) {
+        hex += "0123456789abcdef"[c >> 4];
+        hex += "0123456789abcdef"[c & 15];
+    }
+    return hex;
+}
+std::string BigEndian(uint64_t value, size_t length) {
+    std::string bytes(length, '\0');
+    for (size_t i = 0; i < length; ++i) bytes[length - i - 1] = value >> (8 * i);
+    return bytes;
+}
+std::string EncodedText(const std::string& value) {
+    return BigEndian(value.size(), 4) + value;
+}
+Status CheckPesDictionary(const rapidjson::Value& config) {
+    if (!config.HasMember("meta") || !config["meta"].IsObject())
+        return Status::Invalid("PES1 IK mapping requires dictionary fingerprints");
+    const char* path = std::getenv("ES_PATH_CONF");
+    if (!path || !*path)
+        return Status::Invalid("IK requires ES_PATH_CONF/analysis-ik dictionaries");
+    std::string selected;
+    for (const char* name : {"main", "quantifier", "stopword"}) {
+        auto file = std::filesystem::path(path) / "analysis-ik" / (std::string(name) + ".dic");
+        std::error_code error;
+        uint64_t size = std::filesystem::file_size(file, error);
+        if (error || size > 64 * 1024 * 1024 || (std::string(name) == "main" && size == 0))
+            return Status::Invalid("Missing or oversized PES1 IK dictionary");
+        std::ifstream input(file, std::ios::binary);
+        std::string bytes(size, '\0');
+        if (!input.read(bytes.data(), size) || input.peek() != std::char_traits<char>::eof())
+            return Status::IOError("PES1 IK dictionary changed while reading");
+        PAIMON_ASSIGN_OR_RAISE(std::string hex, Sha(bytes));
+        uint8_t digest[32];
+        PAIMON_RETURN_NOT_OK(Unhex(hex, digest));
+        unsigned char encoded[45] = {};
+        EVP_EncodeBlock(encoded, digest, 32);
+        std::string key = "ik_" + std::string(name);
+        PAIMON_ASSIGN_OR_RAISE(std::string expected, Text(config["meta"], key.c_str()));
+        if (expected != reinterpret_cast<char*>(encoded))
+            return Status::Invalid("PES1 IK dictionary fingerprint mismatch");
+        selected += hex;
+    }
+    return PinDictionary(selected);
+}
+Status AddPesField(const std::string& logical, const std::string& physical,
+                   const rapidjson::Value& config, std::map<std::string, Field>* fields) {
+    Field field;
+    field.physical_name = physical;
+    PAIMON_ASSIGN_OR_RAISE(std::string type, Text(config, "type"));
+    if (type == "dense_vector") {
+        field.type = "VECTOR";
+        if (!config.HasMember("dims") || !config["dims"].IsInt() || config["dims"].GetInt() < 1 ||
+            config["dims"].GetInt() > 1024 || !config.HasMember("index") ||
+            !config["index"].IsTrue() || !config.HasMember("index_options") ||
+            !config["index_options"].IsObject() ||
+            (config.HasMember("element_type") &&
+             (!config["element_type"].IsString() ||
+              std::string(config["element_type"].GetString()) != "float")))
+            return Status::Invalid("Unsupported PES1 vector mapping");
+        field.dimension = config["dims"].GetInt();
+        PAIMON_ASSIGN_OR_RAISE(std::string algorithm, Text(config["index_options"], "type"));
+        field.algorithm = algorithm == "hnsw"                                  ? "HNSW"
+                          : algorithm == "int8_hnsw"                           ? "INT8_HNSW"
+                          : algorithm == "bbq_disk"                            ? "DISKBBQ"
+                          : algorithm == "native_hnsw" || algorithm == "hnswq" ? "HNSWQ"
+                                                                               : "";
+        PAIMON_ASSIGN_OR_RAISE(field.metric, Text(config, "similarity"));
+        if (field.algorithm.empty() ||
+            (field.metric != "l2_norm" && field.metric != "cosine" &&
+             field.metric != "dot_product") ||
+            (field.algorithm == "HNSWQ" && field.metric == "dot_product"))
+            return Status::Invalid("Unsupported PES1 vector algorithm or metric");
+    } else if (type == "text") {
+        field.type = "FULLTEXT";
+        PAIMON_ASSIGN_OR_RAISE(field.analyzer, Text(config, "analyzer"));
+        if (field.analyzer == "ik_smart" || field.analyzer == "ik_max_word")
+            PAIMON_RETURN_NOT_OK(CheckPesDictionary(config));
+        std::transform(field.analyzer.begin(), field.analyzer.end(), field.analyzer.begin(),
+                       [](unsigned char c) { return std::toupper(c); });
+    } else if (type == "keyword") {
+        field.type = "KEYWORD";
+    } else {
+        field.type = "SCALAR";
+        field.scalar_type = type == "byte" || type == "short" || type == "integer" ? "INT"
+                            : type == "long"                                       ? "LONG"
+                            : type == "float"                                      ? "FLOAT"
+                            : type == "double"                                     ? "DOUBLE"
+                            : type == "boolean"                                    ? "BOOLEAN"
+                                                                                   : "";
+        if (field.scalar_type.empty()) return Status::Invalid("Unsupported PES1 scalar type");
+    }
+    if (logical.empty() || physical.empty() || !fields->emplace(logical, std::move(field)).second)
+        return Status::Invalid("Duplicate or empty PES1 field");
+    if (config.HasMember("fields")) {
+        if (!config["fields"].IsObject())
+            return Status::Invalid("Invalid PES1 multi-field mapping");
+        for (auto it = config["fields"].MemberBegin(); it != config["fields"].MemberEnd(); ++it) {
+            if (!it->value.IsObject() || it->value.HasMember("fields"))
+                return Status::Invalid("Nested PES1 multi-field mapping");
+            std::string suffix(it->name.GetString(), it->name.GetStringLength());
+            PAIMON_RETURN_NOT_OK(
+                AddPesField(logical + "." + suffix, physical + "." + suffix, it->value, fields));
+        }
+    }
+    return Status::OK();
+}
+Result<PesMetadata> ParsePes(const std::string& data, int64_t archive_size) {
+    if (data.size() < 36) return Status::Invalid("Truncated PES1 header");
+    Cursor header(data);
+    PAIMON_ASSIGN_OR_RAISE(uint64_t magic, header.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t version, header.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t flags, header.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t header_size, header.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t payload_size, header.Number(8));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t crc, header.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t reserved, header.Number(4));
+    if (magic != 0x50455331 || version != 0x10000 || flags != 0 || header_size != 32 ||
+        reserved != 0 || payload_size != data.size() - 36 || crc != Castagnoli(data.data(), 24))
+        return Status::Invalid("Invalid PES1 header or CRC32C");
+    PAIMON_ASSIGN_OR_RAISE(std::string body, header.Bytes(payload_size));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t payload_crc, header.Number(4));
+    if (payload_crc != Castagnoli(body.data(), body.size()))
+        return Status::Invalid("PES1 payload CRC32C mismatch");
+    Cursor cursor(body);
+    PesMetadata result;
+    PAIMON_ASSIGN_OR_RAISE(std::string index_type, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(std::string module, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(std::string table, cursor.Bytes(32));
+    result.table = Hex(table);
+    PAIMON_ASSIGN_OR_RAISE(std::string branch, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(std::string index_name, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(uint64_t snapshot, cursor.Number(8));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t schema, cursor.Number(8));
+    PAIMON_ASSIGN_OR_RAISE(std::string partition, cursor.Bytes(32));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t bucket, cursor.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t row_start, cursor.Number(8));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t row_end, cursor.Number(8));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t rows, cursor.Number(8));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t docs, cursor.Number(8));
+    if (index_type != "paimon-elasticsearch" || module.empty() || branch.empty() ||
+        index_name.empty() || snapshot > INT64_MAX || schema > INT64_MAX || bucket != UINT32_MAX ||
+        rows > 2147483519 || row_start > INT64_MAX - rows || row_end != row_start + rows - 1 ||
+        docs != rows)
+        return Status::Invalid("Invalid PES1 table, snapshot or row identity");
+    result.identity.snapshot = snapshot;
+    result.identity.schema = schema;
+    result.identity.row_start = row_start;
+    result.identity.rows = rows;
+    std::memcpy(result.identity.partition_sha256, partition.data(), 32);
+    PAIMON_ASSIGN_OR_RAISE(int32_t count, cursor.Count());
+    if (count < 1 || count > 1024) return Status::Invalid("Invalid PES1 field count");
+    std::string columns;
+    std::map<std::string, std::string> configs;
+    std::set<uint64_t> ids;
+    for (int32_t i = 0; i < count; ++i) {
+        PAIMON_ASSIGN_OR_RAISE(uint64_t id, cursor.Number(4));
+        PAIMON_ASSIGN_OR_RAISE(std::string name, cursor.String());
+        PAIMON_ASSIGN_OR_RAISE(std::string type, cursor.String());
+        PAIMON_ASSIGN_OR_RAISE(uint64_t nullable, cursor.Number(1));
+        PAIMON_ASSIGN_OR_RAISE(std::string physical, cursor.String());
+        PAIMON_ASSIGN_OR_RAISE(std::string physical_type, cursor.String());
+        PAIMON_ASSIGN_OR_RAISE(std::string config, cursor.String(8 * 1024 * 1024));
+        if (id > INT32_MAX || !ids.insert(id).second || nullable > 1 || type.empty() ||
+            !result.primary_types.emplace(name, type).second ||
+            !configs.emplace(physical, config).second)
+            return Status::Invalid("Duplicate or invalid PES1 field metadata");
+        columns += BigEndian(id, 4) + EncodedText(name) + EncodedText(type) + char(nullable);
+        rapidjson::Document parsed;
+        parsed.Parse<rapidjson::kParseValidateEncodingFlag | rapidjson::kParseIterativeFlag>(
+            config.data(), config.size());
+        if (parsed.HasParseError() || !parsed.IsObject())
+            return Status::Invalid("Invalid PES1 field JSON");
+        PAIMON_RETURN_NOT_OK(CheckJson(parsed));
+        PAIMON_ASSIGN_OR_RAISE(std::string mapped_type, Text(parsed, "type"));
+        if (mapped_type != physical_type) return Status::Invalid("PES1 physical type mismatch");
+        PAIMON_RETURN_NOT_OK(AddPesField(name, physical, parsed, &result.fields));
+    }
+    PAIMON_ASSIGN_OR_RAISE(std::string columns_sha, Sha(columns));
+    PAIMON_RETURN_NOT_OK(Unhex(columns_sha, result.identity.columns_sha256));
+    PAIMON_ASSIGN_OR_RAISE(std::string mapping, cursor.String(8 * 1024 * 1024));
+    PAIMON_ASSIGN_OR_RAISE(std::string mapping_bytes, cursor.Bytes(32));
+    PAIMON_ASSIGN_OR_RAISE(std::string mapping_sha, Sha(mapping));
+    if (mapping_sha != Hex(mapping_bytes)) return Status::Invalid("PES1 mapping SHA-256 mismatch");
+    std::memcpy(result.identity.mapping_sha256, mapping_bytes.data(), 32);
+    rapidjson::Document mapped;
+    mapped.Parse<rapidjson::kParseValidateEncodingFlag | rapidjson::kParseIterativeFlag>(
+        mapping.data(), mapping.size());
+    if (mapped.HasParseError() || !mapped.IsObject() || !mapped.HasMember("properties") ||
+        !mapped["properties"].IsObject() || mapped["properties"].MemberCount() != configs.size())
+        return Status::Invalid("Invalid PES1 mapping");
+    PAIMON_RETURN_NOT_OK(CheckJson(mapped));
+    for (const auto& [name, config] : configs) {
+        rapidjson::Document field;
+        field.Parse(config.data(), config.size());
+        if (!mapped["properties"].HasMember(name.c_str()) ||
+            mapped["properties"][name.c_str()] != field)
+            return Status::Invalid("PES1 field configuration differs from mapping");
+    }
+    PAIMON_ASSIGN_OR_RAISE(std::string commit, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(uint64_t abi_major, cursor.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t abi_minor, cursor.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(std::string es, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(std::string lucene, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(std::string build, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(std::string native_sha, cursor.Bytes(32));
+    PAIMON_ASSIGN_OR_RAISE(std::string target, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(std::string glibc, cursor.String());
+    PAIMON_ASSIGN_OR_RAISE(std::string semantic_sha, cursor.Bytes(32));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t length, cursor.Number(8));
+    PAIMON_ASSIGN_OR_RAISE(std::string archive_sha, cursor.Bytes(32));
+    result.archive_sha = Hex(archive_sha);
+    PAIMON_ASSIGN_OR_RAISE(uint64_t uncompressed, cursor.Number(8));
+    if (abi_major != 1 || abi_minor != 0 || es != "9.4.0" || lucene != "10.4.0" || build.empty() ||
+        target != "x86_64-unknown-linux-gnu" || glibc.empty() ||
+        length != static_cast<uint64_t>(archive_size))
+        return Status::Invalid("Unsupported PES1 runtime identity or archive length");
+    PAIMON_ASSIGN_OR_RAISE(int32_t files, cursor.Count());
+    if (files < 1) return Status::Invalid("Empty PES1 archive");
+    std::string directory = "elasticpp.paimon.directory.v1", file_json = "{";
+    uint64_t position = 4, total = 0;
+    std::string previous;
+    for (int32_t i = 0; i < files; ++i) {
+        PAIMON_ASSIGN_OR_RAISE(std::string name, cursor.String());
+        PAIMON_ASSIGN_OR_RAISE(uint64_t offset, cursor.Number(8));
+        PAIMON_ASSIGN_OR_RAISE(uint64_t size, cursor.Number(8));
+        PAIMON_ASSIGN_OR_RAISE(std::string sha, cursor.Bytes(32));
+        if (!SafeName(name) || (!previous.empty() && previous >= name) ||
+            offset != position + 4 + name.size() + 8 || offset > length || size > length - offset ||
+            !result.offsets
+                 .emplace(name, Offset{static_cast<int64_t>(offset), static_cast<int64_t>(size)})
+                 .second)
+            return Status::Invalid("Invalid PES1 archive layout");
+        previous = name;
+        position = offset + size;
+        total += size;
+        directory += EncodedText(name) + BigEndian(size, 8) + sha;
+        if (i) file_json += ',';
+        file_json += JsonString(name) + ":{\"length\":" + std::to_string(size) +
+                     ",\"sha256\":" + JsonString(Hex(sha)) + '}';
+    }
+    if (!cursor.Done() || position != length || total != uncompressed ||
+        !result.offsets.count(".paimon-elasticsearch-identity-v1") ||
+        result.offsets.count(kManifest))
+        return Status::Invalid("Invalid PES1 sealed files or trailing metadata");
+    PAIMON_ASSIGN_OR_RAISE(std::string directory_sha, Sha(directory));
+    result.manifest =
+        "{\"format\":\"eslib-native-index-v1\",\"identity\":" + JsonString(result.table) +
+        ",\"rows\":" + std::to_string(rows) + ",\"mapping\":" + JsonString(mapping) +
+        ",\"mappingSha256\":" + JsonString(mapping_sha) +
+        ",\"configSha256\":" + JsonString(columns_sha) + ",\"nativeCommit\":" + JsonString(commit) +
+        ",\"nativeSha256\":" + JsonString(Hex(native_sha)) +
+        ",\"directorySha256\":" + JsonString(directory_sha) + ",\"files\":" + file_json + "}}";
+    return result;
+}
+
 }  // namespace
 
 Result<std::unique_ptr<Archive>> Archive::Create(
@@ -279,64 +571,83 @@ Status Archive::Initialize(const GlobalIndexIOMeta& meta,
         return Status::Invalid("Missing or oversized native ESLib metadata/archive");
     }
     std::string data(meta.metadata->data(), meta.metadata->size());
-    Cursor cursor(data);
-    PAIMON_ASSIGN_OR_RAISE(uint64_t magic, cursor.Number(4));
-    PAIMON_ASSIGN_OR_RAISE(uint64_t version, cursor.Number(4));
-    if (magic != 0x45534d31 || version != 3) {
-        return Status::Invalid("Native ESLib reader requires ESM1 v3; Java archives require Java");
-    }
-    PAIMON_ASSIGN_OR_RAISE(std::string backend, cursor.String());
-    if (backend != "elasticpp") return Status::Invalid("ESM1 backend must be elasticpp");
-    PAIMON_ASSIGN_OR_RAISE(int32_t count, cursor.Count());
-    if (count < 1 || count > 1024) return Status::Invalid("Invalid ESLib primary field count");
-    for (int32_t i = 0; i < count; ++i) {
-        PAIMON_ASSIGN_OR_RAISE(std::string name, cursor.String());
-        PAIMON_ASSIGN_OR_RAISE(std::string type, cursor.String());
-        if (name.empty() || !primary_types_.emplace(name, type).second) {
-            return Status::Invalid("Duplicate or empty ESLib primary field");
-        }
-    }
-    PAIMON_ASSIGN_OR_RAISE(int32_t fields, cursor.Count());
-    if (fields < 1 || fields > 1024) return Status::Invalid("Invalid ESLib field count");
-    for (int32_t i = 0; i < fields; ++i) {
-        PAIMON_ASSIGN_OR_RAISE(std::string name, cursor.String());
-        Field field;
-        PAIMON_ASSIGN_OR_RAISE(field.type, cursor.String());
-        PAIMON_ASSIGN_OR_RAISE(field.algorithm, cursor.NullableString());
-        PAIMON_ASSIGN_OR_RAISE(uint64_t dimension, cursor.Number(4));
-        if (dimension > 1024) return Status::Invalid("Invalid ESLib vector dimension");
-        field.dimension = dimension;
-        PAIMON_ASSIGN_OR_RAISE(field.metric, cursor.NullableString());
-        PAIMON_ASSIGN_OR_RAISE(field.analyzer, cursor.NullableString());
-        PAIMON_ASSIGN_OR_RAISE(field.scalar_type, cursor.NullableString());
-        PAIMON_ASSIGN_OR_RAISE(int32_t parameters, cursor.Count());
-        if (parameters != 0)
-            return Status::Invalid("Unsupported native ESLib algorithm parameters");
-        if (name.empty() || name[0] == '_' || !fields_.emplace(name, std::move(field)).second) {
-            return Status::Invalid("Invalid native ESLib field name");
-        }
-    }
-    for (const auto& [name, type] : primary_types_) {
-        if (!fields_.count(name)) return Status::Invalid("Missing ESLib primary field config");
-    }
-    PAIMON_ASSIGN_OR_RAISE(int32_t files, cursor.Count());
-    if (files < 2) return Status::Invalid("Native ESLib archive needs manifest and sealed files");
+    const bool pes = data.size() >= 4 && data.compare(0, 4, "PES1") == 0;
     std::map<std::string, Offset> offsets;
-    for (int32_t i = 0; i < files; ++i) {
-        PAIMON_ASSIGN_OR_RAISE(std::string name, cursor.String());
-        PAIMON_ASSIGN_OR_RAISE(uint64_t offset, cursor.Number(8));
-        PAIMON_ASSIGN_OR_RAISE(uint64_t length, cursor.Number(8));
-        if (!SafeName(name) || offset > static_cast<uint64_t>(meta.file_size) ||
-            length > static_cast<uint64_t>(meta.file_size) - offset ||
-            !offsets
-                 .emplace(name, Offset{static_cast<int64_t>(offset), static_cast<int64_t>(length)})
-                 .second) {
-            return Status::Invalid("Invalid native ESLib archive range/name");
+    PesMetadata parsed;
+    int32_t files = 0;
+    if (pes) {
+        PAIMON_ASSIGN_OR_RAISE(parsed, ParsePes(data, meta.file_size));
+        offsets = parsed.offsets;
+        fields_ = parsed.fields;
+        primary_types_ = parsed.primary_types;
+        files = offsets.size();
+        index_type_ = "paimon-elasticsearch";
+        row_start_ = parsed.identity.row_start;
+    } else {
+        Cursor cursor(data);
+        PAIMON_ASSIGN_OR_RAISE(uint64_t magic, cursor.Number(4));
+        PAIMON_ASSIGN_OR_RAISE(uint64_t version, cursor.Number(4));
+        if (magic != 0x45534d31 || version != 3) {
+            return Status::Invalid(
+                "Native ESLib reader requires ESM1 v3; Java archives require Java");
+        }
+        PAIMON_ASSIGN_OR_RAISE(std::string backend, cursor.String());
+        if (backend != "elasticpp") return Status::Invalid("ESM1 backend must be elasticpp");
+        PAIMON_ASSIGN_OR_RAISE(int32_t count, cursor.Count());
+        if (count < 1 || count > 1024) return Status::Invalid("Invalid ESLib primary field count");
+        for (int32_t i = 0; i < count; ++i) {
+            PAIMON_ASSIGN_OR_RAISE(std::string name, cursor.String());
+            PAIMON_ASSIGN_OR_RAISE(std::string type, cursor.String());
+            if (name.empty() || !primary_types_.emplace(name, type).second) {
+                return Status::Invalid("Duplicate or empty ESLib primary field");
+            }
+        }
+        PAIMON_ASSIGN_OR_RAISE(int32_t fields, cursor.Count());
+        if (fields < 1 || fields > 1024) return Status::Invalid("Invalid ESLib field count");
+        for (int32_t i = 0; i < fields; ++i) {
+            PAIMON_ASSIGN_OR_RAISE(std::string name, cursor.String());
+            Field field;
+            PAIMON_ASSIGN_OR_RAISE(field.type, cursor.String());
+            PAIMON_ASSIGN_OR_RAISE(field.algorithm, cursor.NullableString());
+            PAIMON_ASSIGN_OR_RAISE(uint64_t dimension, cursor.Number(4));
+            if (dimension > 1024) return Status::Invalid("Invalid ESLib vector dimension");
+            field.dimension = dimension;
+            PAIMON_ASSIGN_OR_RAISE(field.metric, cursor.NullableString());
+            PAIMON_ASSIGN_OR_RAISE(field.analyzer, cursor.NullableString());
+            PAIMON_ASSIGN_OR_RAISE(field.scalar_type, cursor.NullableString());
+            PAIMON_ASSIGN_OR_RAISE(int32_t parameters, cursor.Count());
+            if (parameters != 0)
+                return Status::Invalid("Unsupported native ESLib algorithm parameters");
+            if (name.empty() || name[0] == '_' || !fields_.emplace(name, std::move(field)).second) {
+                return Status::Invalid("Invalid native ESLib field name");
+            }
+        }
+        for (const auto& [name, type] : primary_types_) {
+            if (!fields_.count(name)) return Status::Invalid("Missing ESLib primary field config");
+        }
+        PAIMON_ASSIGN_OR_RAISE(files, cursor.Count());
+        if (files < 2)
+            return Status::Invalid("Native ESLib archive needs manifest and sealed files");
+        for (int32_t i = 0; i < files; ++i) {
+            PAIMON_ASSIGN_OR_RAISE(std::string name, cursor.String());
+            PAIMON_ASSIGN_OR_RAISE(uint64_t offset, cursor.Number(8));
+            PAIMON_ASSIGN_OR_RAISE(uint64_t length, cursor.Number(8));
+            if (!SafeName(name) || offset > static_cast<uint64_t>(meta.file_size) ||
+                length > static_cast<uint64_t>(meta.file_size) - offset ||
+                !offsets
+                     .emplace(name,
+                              Offset{static_cast<int64_t>(offset), static_cast<int64_t>(length)})
+                     .second) {
+                return Status::Invalid("Invalid native ESLib archive range/name");
+            }
+        }
+        if (!cursor.Done() || !offsets.count(kManifest)) {
+            return Status::Invalid("Trailing ESM1 data or missing native ESLib manifest");
         }
     }
-    if (!cursor.Done() || !offsets.count(kManifest)) {
-        return Status::Invalid("Trailing ESM1 data or missing native ESLib manifest");
-    }
+    auto expected_type = options.find("native.expected-index-type");
+    if (expected_type != options.end() && expected_type->second != index_type_)
+        return Status::Invalid("Native metadata format differs from registered index type");
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<InputStream> stream,
                            reader->GetInputStream(meta.file_path));
     if (!stream) return Status::Invalid("Null native ESLib archive stream");
@@ -375,11 +686,26 @@ Status Archive::Initialize(const GlobalIndexIOMeta& meta,
         position += entry->second.length;
     }
     if (position != meta.file_size) return Status::Invalid("Trailing ESLib archive bytes");
-    auto descriptor = offsets.at(kManifest);
-    if (descriptor.length > 16 * 1024 * 1024)
-        return Status::Invalid("ESLib manifest exceeds limit");
-    PAIMON_ASSIGN_OR_RAISE(std::string manifest_bytes,
-                           Read(stream.get(), descriptor.offset, descriptor.length));
+    std::string manifest_bytes = parsed.manifest;
+    if (!pes) {
+        auto descriptor = offsets.at(kManifest);
+        if (descriptor.length > 16 * 1024 * 1024)
+            return Status::Invalid("ESLib manifest exceeds limit");
+        PAIMON_ASSIGN_OR_RAISE(manifest_bytes,
+                               Read(stream.get(), descriptor.offset, descriptor.length));
+    } else {
+        Digest digest;
+        PAIMON_RETURN_NOT_OK(digest.Init());
+        std::array<char, 1024 * 1024> bytes{};
+        for (int64_t offset = 0; offset < meta.file_size;) {
+            int64_t size = std::min<int64_t>(bytes.size(), meta.file_size - offset);
+            PAIMON_RETURN_NOT_OK(ReadExact(stream.get(), bytes.data(), size, offset));
+            PAIMON_RETURN_NOT_OK(digest.Add(bytes.data(), size));
+            offset += size;
+        }
+        PAIMON_ASSIGN_OR_RAISE(std::string actual, digest.Finish());
+        if (actual != parsed.archive_sha) return Status::Invalid("PES1 archive SHA-256 mismatch");
+    }
     rapidjson::Document manifest;
     manifest.Parse<rapidjson::kParseValidateEncodingFlag | rapidjson::kParseIterativeFlag>(
         manifest_bytes.data(), manifest_bytes.size());
@@ -404,19 +730,15 @@ Status Archive::Initialize(const GlobalIndexIOMeta& meta,
         return Status::Invalid("Invalid native ESLib manifest identity/digest");
     }
     rows_ = manifest["rows"].GetInt64();
-    std::string selected_dictionary;
-    PAIMON_ASSIGN_OR_RAISE(std::string actual_config_sha,
-                           ConfigDigest(fields_, &selected_dictionary));
-    if (actual_config_sha != columns_sha)
-        return Status::Invalid("ESLib config/dictionary SHA-256 mismatch");
-    if (!selected_dictionary.empty()) {
-        static std::mutex dictionary_mutex;
-        static std::string pinned_dictionary;
-        std::lock_guard<std::mutex> lock(dictionary_mutex);
-        if (!pinned_dictionary.empty() && pinned_dictionary != selected_dictionary) {
-            return Status::Invalid("IK dictionaries changed; use a fresh process");
+    if (!pes) {
+        std::string selected_dictionary;
+        PAIMON_ASSIGN_OR_RAISE(std::string actual_config_sha,
+                               ConfigDigest(fields_, &selected_dictionary));
+        if (actual_config_sha != columns_sha)
+            return Status::Invalid("ESLib config/dictionary SHA-256 mismatch");
+        if (!selected_dictionary.empty()) {
+            PAIMON_RETURN_NOT_OK(PinDictionary(selected_dictionary));
         }
-        pinned_dictionary = selected_dictionary;
     }
     rapidjson::Document mapping_json;
     mapping_json.Parse<rapidjson::kParseValidateEncodingFlag | rapidjson::kParseIterativeFlag>(
@@ -430,68 +752,74 @@ Status Archive::Initialize(const GlobalIndexIOMeta& meta,
     }
     PAIMON_RETURN_NOT_OK(CheckJson(mapping_json));
     const auto& properties = mapping_json["properties"];
-    if (properties.MemberCount() != fields_.size())
-        return Status::Invalid("ESLib mapping field count mismatch");
-    std::set<std::string> physical_names;
-    for (auto& [name, field] : fields_) {
-        field.physical_name = name;
-        if (name.find('.') != std::string::npos) {
-            PAIMON_ASSIGN_OR_RAISE(std::string digest, Sha(name));
-            std::string base = "eslib_" + digest;
-            field.physical_name = base;
-            for (int32_t suffix = 1;
-                 fields_.count(field.physical_name) || physical_names.count(field.physical_name);
-                 ++suffix) {
-                field.physical_name = base + "_" + std::to_string(suffix);
+    if (!pes) {
+        if (properties.MemberCount() != fields_.size())
+            return Status::Invalid("ESLib mapping field count mismatch");
+        std::set<std::string> physical_names;
+        for (auto& [name, field] : fields_) {
+            field.physical_name = name;
+            if (name.find('.') != std::string::npos) {
+                PAIMON_ASSIGN_OR_RAISE(std::string digest, Sha(name));
+                std::string base = "eslib_" + digest;
+                field.physical_name = base;
+                for (int32_t suffix = 1; fields_.count(field.physical_name) ||
+                                         physical_names.count(field.physical_name);
+                     ++suffix) {
+                    field.physical_name = base + "_" + std::to_string(suffix);
+                }
             }
-        }
-        physical_names.insert(field.physical_name);
-        if (!properties.HasMember(field.physical_name.c_str()))
-            return Status::Invalid("Missing ESLib mapped field");
-        const auto& physical = properties[field.physical_name.c_str()];
-        PAIMON_ASSIGN_OR_RAISE(std::string type, Text(physical, "type"));
-        if (field.type == "VECTOR") {
-            PAIMON_ASSIGN_OR_RAISE(std::string similarity, Text(physical, "similarity"));
-            std::string metric = field.metric;
-            if (metric == "l2" || metric == "euclidean") metric = "l2_norm";
-            if (metric == "ip") metric = "dot_product";
-            std::string algorithm = field.algorithm == "HNSW"        ? "hnsw"
-                                    : field.algorithm == "INT8_HNSW" ? "int8_hnsw"
-                                    : field.algorithm == "DISKBBQ"   ? "bbq_disk"
-                                                                     : "";
-            if (type != "dense_vector" || field.dimension < 1 || !physical.HasMember("dims") ||
-                !physical["dims"].IsInt() || physical["dims"].GetInt() != field.dimension ||
-                similarity != metric || algorithm.empty() || !physical.HasMember("index_options") ||
-                !physical["index_options"].IsObject())
-                return Status::Invalid("ESLib vector mapping mismatch");
-            PAIMON_ASSIGN_OR_RAISE(std::string mapped_algorithm,
-                                   Text(physical["index_options"], "type"));
-            if (algorithm != mapped_algorithm)
-                return Status::Invalid("ESLib vector algorithm mismatch");
-        } else if (field.type == "FULLTEXT") {
-            if (type != "text") return Status::Invalid("ESLib text mapping mismatch");
-            PAIMON_ASSIGN_OR_RAISE(std::string analyzer, Text(physical, "analyzer"));
-            std::string expected = field.analyzer;
-            std::transform(expected.begin(), expected.end(), expected.begin(),
-                           [](unsigned char c) { return std::tolower(c); });
-            if (expected.empty()) expected = "standard";
-            if (analyzer != expected) return Status::Invalid("ESLib analyzer mismatch");
-        } else {
-            std::string expected = field.type == "KEYWORD"          ? "keyword"
-                                   : field.type == "DATE"           ? "date"
-                                   : field.scalar_type == "INT"     ? "integer"
-                                   : field.scalar_type == "LONG"    ? "long"
-                                   : field.scalar_type == "FLOAT"   ? "float"
-                                   : field.scalar_type == "DOUBLE"  ? "double"
-                                   : field.scalar_type == "KEYWORD" ? "keyword"
-                                   : field.scalar_type == "DATE"    ? "date"
-                                                                    : "";
-            if (expected.empty() || type != expected)
-                return Status::Invalid("ESLib scalar mapping mismatch");
+            physical_names.insert(field.physical_name);
+            if (!properties.HasMember(field.physical_name.c_str()))
+                return Status::Invalid("Missing ESLib mapped field");
+            const auto& physical = properties[field.physical_name.c_str()];
+            PAIMON_ASSIGN_OR_RAISE(std::string type, Text(physical, "type"));
+            if (field.type == "VECTOR") {
+                PAIMON_ASSIGN_OR_RAISE(std::string similarity, Text(physical, "similarity"));
+                std::string metric = field.metric;
+                if (metric == "l2" || metric == "euclidean") metric = "l2_norm";
+                if (metric == "ip") metric = "dot_product";
+                std::string algorithm = field.algorithm == "HNSW"        ? "hnsw"
+                                        : field.algorithm == "INT8_HNSW" ? "int8_hnsw"
+                                        : field.algorithm == "DISKBBQ"   ? "bbq_disk"
+                                        : field.algorithm == "HNSWQ"     ? "native_hnsw"
+                                                                         : "";
+                if (type != "dense_vector" || field.dimension < 1 || !physical.HasMember("dims") ||
+                    !physical["dims"].IsInt() || physical["dims"].GetInt() != field.dimension ||
+                    similarity != metric || algorithm.empty() ||
+                    !physical.HasMember("index_options") || !physical["index_options"].IsObject())
+                    return Status::Invalid("ESLib vector mapping mismatch");
+                PAIMON_ASSIGN_OR_RAISE(std::string mapped_algorithm,
+                                       Text(physical["index_options"], "type"));
+                if (algorithm != mapped_algorithm)
+                    return Status::Invalid("ESLib vector algorithm mismatch");
+            } else if (field.type == "FULLTEXT") {
+                if (type != "text") return Status::Invalid("ESLib text mapping mismatch");
+                PAIMON_ASSIGN_OR_RAISE(std::string analyzer, Text(physical, "analyzer"));
+                std::string expected = field.analyzer;
+                std::transform(expected.begin(), expected.end(), expected.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                if (expected.empty()) expected = "standard";
+                if (analyzer != expected) return Status::Invalid("ESLib analyzer mismatch");
+            } else {
+                std::string expected = field.type == "KEYWORD"          ? "keyword"
+                                       : field.type == "DATE"           ? "date"
+                                       : field.scalar_type == "INT"     ? "integer"
+                                       : field.scalar_type == "LONG"    ? "long"
+                                       : field.scalar_type == "FLOAT"   ? "float"
+                                       : field.scalar_type == "DOUBLE"  ? "double"
+                                       : field.scalar_type == "KEYWORD" ? "keyword"
+                                       : field.scalar_type == "DATE"    ? "date"
+                                                                        : "";
+                if (expected.empty() || type != expected)
+                    return Status::Invalid("ESLib scalar mapping mismatch");
+            }
         }
     }
     auto option = [&](const char* key) -> std::string {
-        auto it = options.find(key);
+        std::string name = key;
+        if (pes && name.rfind("global-index.es-index.", 0) == 0)
+            name.replace(0, 22, "global-index.paimon-elasticsearch.");
+        auto it = options.find(name);
         return it == options.end() ? std::string() : it->second;
     };
     std::string library_path = option("global-index.es-index.native.library-path");
@@ -552,7 +880,7 @@ Status Archive::Initialize(const GlobalIndexIOMeta& meta,
         return Status::Invalid("elasticpp capabilities differ from the pinned archive runtime");
     }
     if (!manifest.HasMember("files") || !manifest["files"].IsObject() ||
-        manifest["files"].MemberCount() != offsets.size() - 1)
+        manifest["files"].MemberCount() != offsets.size() - (pes ? 0 : 1))
         return Status::Invalid("ESLib sealed file table mismatch");
     std::error_code error;
     std::string root = option("global-index.es-index.native.temp-directory");
@@ -598,11 +926,12 @@ Status Archive::Initialize(const GlobalIndexIOMeta& meta,
         if (expected != actual) return Status::Invalid("ESLib sealed file SHA-256 mismatch");
     }
     abi::Identity identity;
+    if (pes) identity = parsed.identity;
     identity.table = identity_name.data();
     identity.table_length = identity_name.size();
     identity.rows = rows_;
     PAIMON_ASSIGN_OR_RAISE(std::string empty_sha, Sha(""));
-    PAIMON_RETURN_NOT_OK(Unhex(empty_sha, identity.partition_sha256));
+    if (!pes) PAIMON_RETURN_NOT_OK(Unhex(empty_sha, identity.partition_sha256));
     PAIMON_RETURN_NOT_OK(Unhex(columns_sha, identity.columns_sha256));
     PAIMON_RETURN_NOT_OK(Unhex(mapping_sha, identity.mapping_sha256));
     abi::OpenRequest request;
