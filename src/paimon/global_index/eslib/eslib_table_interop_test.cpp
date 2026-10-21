@@ -53,7 +53,9 @@ class NativeIndexCountingFileSystem final : public LocalFileSystem {
  public:
     using LocalFileSystem::Open;
     Result<std::unique_ptr<InputStream>> Open(const std::string& path) const override {
-        if (path.find("es-index-") != std::string::npos) ++native_archive_reads_;
+        if (path.find("es-index-") != std::string::npos ||
+            path.find("paimon-elasticsearch-") != std::string::npos)
+            ++native_archive_reads_;
         return LocalFileSystem::Open(path);
     }
     int32_t NativeArchiveReads() const {
@@ -110,6 +112,7 @@ using TableInteropParam = std::tuple<std::string, std::string>;
 class ESLibTableInteropTest : public ::testing::Test,
                               public ::testing::WithParamInterface<TableInteropParam> {
  protected:
+    std::string index_type_ = "es-index";
     void SetUp() override {
         const char* root = std::getenv("PAIMON_ESLIB_TABLE_FIXTURE_DIR");
         const char* library = std::getenv("PAIMON_ESLIB_NATIVE_LIBRARY");
@@ -127,11 +130,13 @@ class ESLibTableInteropTest : public ::testing::Test,
         table_ = std::string(root) + "/" + oracle_["tablePath"].GetString();
         indexed_snapshot_ = oracle_["indexedSnapshot"].GetInt64();
         latest_snapshot_ = oracle_["latestSnapshot"].GetInt64();
+        const char* selected_type = std::getenv("PAIMON_TABLE_INDEX_TYPE");
+        if (selected_type) index_type_ = selected_type;
         options_ = {{Options::FILE_SYSTEM, "local"},
                     {Options::GLOBAL_INDEX_THREAD_NUM, "2"},
-                    {"global-index.es-index.native.library-path", library},
-                    {"global-index.es-index.native.commit", commit},
-                    {"global-index.es-index.native.sha256", sha}};
+                    {"global-index." + index_type_ + ".native.library-path", library},
+                    {"global-index." + index_type_ + ".native.commit", commit},
+                    {"global-index." + index_type_ + ".native.sha256", sha}};
         fs_ = std::make_shared<NativeIndexCountingFileSystem>();
     }
     Result<std::unique_ptr<GlobalIndexScan>> ScanIndex(
@@ -333,14 +338,14 @@ TEST_P(ESLibTableInteropTest, ScalarNativeQueriesRetainUnindexedAppendAndNulls) 
     ASSERT_EQ(fs_->NativeArchiveReads(), indexed_reads)
         << "Incomplete index coverage must fall back before pruning new rows";
     auto wrong = options_;
-    wrong["global-index.es-index.native.sha256"] = std::string(64, '0');
+    wrong["global-index." + index_type_ + ".native.sha256"] = std::string(64, '0');
     options_ = wrong;
     ASSERT_NOK_WITH_MSG(Fetch(indexed_snapshot_, equal), "must match");
 }
 TEST_P(ESLibTableInteropTest, VectorTopKReadsCompleteRowsAndScores) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalIndexScan> scan, ScanIndex());
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> reader,
-                         scan->CreateReader("embedding", "es-index", std::nullopt));
+                         scan->CreateReader("embedding", index_type_, std::nullopt));
     ASSERT_TRUE(reader);
     auto search = TableVectorSearch();
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<ScoredGlobalIndexResult> result,
@@ -361,7 +366,7 @@ TEST_P(ESLibTableInteropTest, VectorTopKReadsCompleteRowsAndScores) {
 TEST_P(ESLibTableInteropTest, VectorGlobalPrefilterCrossesShardOffsets) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalIndexScan> scan, ScanIndex());
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> reader,
-                         scan->CreateReader("embedding", "es-index", std::nullopt));
+                         scan->CreateReader("embedding", index_type_, std::nullopt));
     ASSERT_TRUE(reader);
     auto search = TableVectorSearch(1);
     search->pre_filter = [](int64_t row) { return row >= 64 && row % 2 == 0; };
@@ -384,7 +389,7 @@ TEST_P(ESLibTableInteropTest, VectorGlobalPrefilterCrossesShardOffsets) {
 TEST_P(ESLibTableInteropTest, FullTextAndIncludeIdsReadCompleteRows) {
     ASSERT_OK_AND_ASSIGN(std::unique_ptr<GlobalIndexScan> scan, ScanIndex());
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> reader,
-                         scan->CreateReader("title", "es-index", std::nullopt));
+                         scan->CreateReader("title", index_type_, std::nullopt));
     ASSERT_TRUE(reader);
     auto search =
         std::make_shared<FullTextSearch>("title", "{\"match\":{\"query\":\"even\"}}", 256);
@@ -419,5 +424,6 @@ TEST_P(ESLibTableInteropTest, FullTextAndIncludeIdsReadCompleteRows) {
 }
 INSTANTIATE_TEST_SUITE_P(JavaCommittedTables, ESLibTableInteropTest,
                          ::testing::Combine(::testing::Values("parquet", "orc"),
-                                            ::testing::Values("hnsw", "int8_hnsw", "diskbbq")));
+                                            ::testing::Values("hnsw", "int8_hnsw", "diskbbq",
+                                                              "hnswq")));
 }  // namespace paimon::test

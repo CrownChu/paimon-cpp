@@ -41,6 +41,7 @@
 #include "paimon/fs/file_system.h"
 #include "paimon/memory/bytes.h"
 #include "rapidjson/document.h"
+#include "rapidjson/memorystream.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
 
@@ -103,6 +104,14 @@ bool SafeName(const std::string& name) {
     return !name.empty() && name.size() <= 4096 && name != "." && name != ".." &&
            name.find_first_of("/\\") == std::string::npos && name.find('\0') == std::string::npos;
 }
+bool ValidUtf8(const std::string& text) {
+    rapidjson::MemoryStream stream(text.data(), text.size());
+    while (stream.Tell() < text.size()) {
+        unsigned codepoint;
+        if (!rapidjson::UTF8<>::Decode(stream, &codepoint)) return false;
+    }
+    return true;
+}
 class Cursor {
  public:
     explicit Cursor(const std::string& data) : data_(data) {}
@@ -133,7 +142,8 @@ class Cursor {
         }
         std::string value = data_.substr(offset_, size);
         offset_ += size;
-        if (value.find('\0') != std::string::npos) return Status::Invalid("NUL in ESM1 string");
+        if (value.find('\0') != std::string::npos || !ValidUtf8(value))
+            return Status::Invalid("Invalid UTF-8 native metadata string");
         return value;
     }
     Result<std::string> NullableString() {
@@ -150,6 +160,35 @@ class Cursor {
     const std::string& data_;
     size_t offset_ = 0;
 };
+Result<std::string> UnwrapPes(const std::string& bytes, int64_t archive_size) {
+    if (bytes.size() < 4 || bytes.compare(0, 4, "PEQ1") != 0) return bytes;
+    Cursor input(bytes);
+    PAIMON_ASSIGN_OR_RAISE(uint64_t magic, input.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t version, input.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t total, input.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t pes_length, input.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t name_length, input.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t reserved, input.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t sidecar_length, input.Number(8));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t root_length, input.Number(4));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t reserved2, input.Number(4));
+    uint64_t blocks = archive_size / 65536 + (archive_size % 65536 != 0);
+    uint64_t expected_root = 192 + ((blocks + 1023) / 1024) * 32;
+    if (magic != 0x50455131 || version != 0x10000 || total != bytes.size() || reserved ||
+        reserved2 || pes_length < 36 || pes_length > kMaxMetadata || name_length == 0 ||
+        name_length > 4096 || 104 + pes_length + name_length != total ||
+        root_length != expected_root || root_length > 1024 * 1024 ||
+        sidecar_length != expected_root + blocks * 32)
+        return Status::Invalid("Invalid PEQ1 metadata envelope");
+    PAIMON_ASSIGN_OR_RAISE(std::string digests, input.Bytes(64));
+    PAIMON_ASSIGN_OR_RAISE(std::string pes, input.Bytes(pes_length));
+    PAIMON_ASSIGN_OR_RAISE(std::string name, input.Bytes(name_length));
+    if (!input.Done() || !SafeName(name) || !ValidUtf8(name) || pes.compare(0, 4, "PES1") != 0)
+        return Status::Invalid("Invalid PEQ1 nested metadata or sidecar name");
+    // The local reader verifies the complete archive SHA-256 and every sealed file.
+    // PQR1 block hashes are needed only by the separate remote range-read path.
+    return pes;
+}
 Status ReadExact(InputStream* stream, char* output, int64_t length, int64_t offset) {
     while (length > 0) {
         PAIMON_ASSIGN_OR_RAISE(int64_t count, stream->Read(output, length, offset));
@@ -570,7 +609,9 @@ Status Archive::Initialize(const GlobalIndexIOMeta& meta,
     if (!reader || !meta.metadata || meta.metadata->size() > kMaxMetadata || meta.file_size < 4) {
         return Status::Invalid("Missing or oversized native ESLib metadata/archive");
     }
-    std::string data(meta.metadata->data(), meta.metadata->size());
+    PAIMON_ASSIGN_OR_RAISE(
+        std::string data,
+        UnwrapPes(std::string(meta.metadata->data(), meta.metadata->size()), meta.file_size));
     const bool pes = data.size() >= 4 && data.compare(0, 4, "PES1") == 0;
     std::map<std::string, Offset> offsets;
     PesMetadata parsed;

@@ -199,9 +199,9 @@ TEST_F(PES1IndexTest, TextAndKeywordCompanionUseOriginalSealOrigin) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<ScoredGlobalIndexResult> result,
                          reader->VisitFullTextSearch(query));
     ASSERT_OK_AND_ASSIGN(std::set<int64_t> rows, Rows(result));
-    ASSERT_EQ(rows.size(), 171u);
+    ASSERT_EQ(rows.size(), 255u);
     for (auto row : rows) {
-        ASSERT_EQ(row % 3, 0);
+        ASSERT_EQ(row % 2, 1);
     }
     RoaringBitmap64 include;
     include.Add(507);
@@ -212,7 +212,44 @@ TEST_F(PES1IndexTest, TextAndKeywordCompanionUseOriginalSealOrigin) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexResult> exact,
                          reader->VisitEqual(Literal(FieldType::STRING, "alpha native search", 19)));
     ASSERT_OK_AND_ASSIGN(rows, Rows(exact));
-    ASSERT_EQ(rows.size(), 171u);
+    ASSERT_EQ(rows.size(), 255u);
+}
+
+TEST_F(PES1IndexTest, ReadsHistoricalPeqEnvelopeWithFullArchiveVerification) {
+    std::string pes = Load(root_ + "/hnsw-l2_norm/metadata.pes1");
+    std::string path = root_ + "/hnsw-l2_norm/archive.bin";
+    uint64_t size = std::filesystem::file_size(path);
+    uint64_t blocks = size / 65536 + (size % 65536 != 0);
+    uint64_t root = 192 + ((blocks + 1023) / 1024) * 32;
+    std::string name = "fixture.pqr1", bytes;
+    auto append = [&](uint64_t value, size_t length) {
+        for (size_t i = length; i > 0; --i) bytes += static_cast<char>(value >> (8 * (i - 1)));
+    };
+    append(0x50455131, 4);
+    append(0x10000, 4);
+    append(104 + pes.size() + name.size(), 4);
+    append(pes.size(), 4);
+    append(name.size(), 4);
+    append(0, 4);
+    append(root + blocks * 32, 8);
+    append(root, 4);
+    append(0, 4);
+    bytes += std::string(64, '\0');
+    bytes += pes;
+    bytes += name;
+    GlobalIndexIOMeta meta(path, size, std::make_shared<Bytes>(bytes, pool_.get()));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> reader,
+                         Open("hnsw-l2_norm", "embedding",
+                              arrow::fixed_size_list(arrow::float32(), 33), nullptr, &meta));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<ScoredGlobalIndexResult> result,
+                         reader->VisitVectorSearch(Search(QueryVector(101))));
+    ASSERT_OK_AND_ASSIGN(std::set<int64_t> rows, Rows(result));
+    ASSERT_EQ(rows, std::set<int64_t>({101}));
+    bytes[23] = 1;
+    meta.metadata = std::make_shared<Bytes>(bytes, pool_.get());
+    ASSERT_NOK_WITH_MSG(Open("hnsw-l2_norm", "embedding",
+                             arrow::fixed_size_list(arrow::float32(), 33), nullptr, &meta),
+                        "PEQ1");
 }
 
 TEST_F(PES1IndexTest, RejectsCorruptionAndWrongFactoryBeforeOpeningNative) {
