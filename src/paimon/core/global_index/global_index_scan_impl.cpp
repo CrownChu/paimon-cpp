@@ -252,7 +252,7 @@ GlobalIndexIOMeta GlobalIndexScanImpl::ToGlobalIndexIOMeta(
 
 Result<std::shared_ptr<GlobalIndexResult>> GlobalIndexScanImpl::Scan(
     const std::shared_ptr<Predicate>& predicate) {
-    // Native es-index archives can lag the selected snapshot after an append. Do
+    // Native archives in either format can lag the selected snapshot after an append. Do
     // not use their hits to prune rows unless all participating indexes cover the
     // snapshot. Keep the existing indexed-domain behavior for other backends and
     // for explicit vector/full-text CreateReader calls.
@@ -263,7 +263,8 @@ Result<std::shared_ptr<GlobalIndexResult>> GlobalIndexScanImpl::Scan(
         for (const auto& name : fields) {
             PAIMON_ASSIGN_OR_RAISE(DataField field, table_schema_->GetField(name));
             auto found = index_metas_.find(field.Id());
-            if (found != index_metas_.end() && found->second.count("es-index") != 0) {
+            if (found != index_metas_.end() && (found->second.count("es-index") != 0 ||
+                                                found->second.count("paimon-elasticsearch") != 0)) {
                 uses_es_index = true;
                 break;
             }
